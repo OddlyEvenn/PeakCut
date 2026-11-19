@@ -6,7 +6,7 @@ import threading
 import time
 from pathlib import Path
 
-from . import auth, config, creators, ctx, jobs
+from . import auth, config, creators, ctx, jobs, live
 
 _lock = threading.RLock()
 _SEEN_FILE = config.DATA_DIR / "seen_sources.json"
@@ -46,6 +46,8 @@ def fetch_recent_channel_videos(channel_url: str, limit: int = 2) -> list:
     if not channel_url:
         return []
     url = channel_url.strip()
+    if ("youtube.com/@" in url or "youtube.com/channel/" in url) and not any(x in url for x in ("/streams", "/videos")):
+        url = url.rstrip("/") + "/streams"
     cmd = ["yt-dlp", "--flat-playlist", "--dump-single-json", "--playlist-end", str(limit), url]
     try:
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
@@ -58,8 +60,9 @@ def fetch_recent_channel_videos(channel_url: str, limit: int = 2) -> list:
             vid = e.get("id") or ""
             v_url = e.get("url") or (f"https://www.youtube.com/watch?v={vid}" if vid else "")
             title = e.get("title") or "Stream"
+            is_live = (e.get("live_status") == "is_live") or bool(e.get("is_live"))
             if vid and v_url:
-                out.append({"id": vid, "url": v_url, "title": title})
+                out.append({"id": vid, "url": v_url, "title": title, "is_live": is_live})
         return out
     except Exception as e:
         print(f"[PeakCut] [POLLER ERROR] Failed to fetch channel {channel_url}: {e}", flush=True)
@@ -114,19 +117,33 @@ def check_creator_streams(cid: str, max_check: int = 2) -> list:
             vid = v["id"]
             v_url = v["url"]
             title = v["title"]
+            is_live = v.get("is_live", False)
 
             # Filter for GTA 6 if game focus is enabled
             if focus and not matches_game_filter(title, focus):
                 print(f"[PeakCut] [POLLER] Skipping non-GTA stream: '{title}'", flush=True)
                 continue
 
+            # Active live broadcast: auto-record in real-time, do NOT queue as static download job
+            if is_live:
+                if not live.active_for(c["id"]):
+                    try:
+                        print(f"[PeakCut] [LIVE] Auto-starting real-time recording for {c['name']} (LIVE NOW): '{title}'", flush=True)
+                        live.start_session(c, v_url)
+                        creators.log(c["id"], f"Auto-started live recording: {title}")
+                        circuit_breaker.creator.record_success(cid)
+                    except Exception as e:
+                        print(f"[PeakCut] [LIVE ERROR] Could not start live recording for {v_url}: {e}", flush=True)
+                continue
+
+            # Completed VOD/video: process through regular clipping job
             if is_seen(vid) or v_url in existing_job_urls:
                 continue
 
             # Mark seen immediately so concurrent pollers won't duplicate
             mark_seen(vid)
             try:
-                print(f"[PeakCut] [POLLER] Found new GTA stream for {c['name']}: '{title}' ({v_url})", flush=True)
+                print(f"[PeakCut] [POLLER] Found new GTA stream VOD for {c['name']}: '{title}' ({v_url})", flush=True)
                 job = jobs.create({"type": "url", "url": v_url, "name": title}, {}, creator=cid)
                 creators.log(cid, f"Auto-detected GTA stream: {title}")
                 new_jobs.append(job)

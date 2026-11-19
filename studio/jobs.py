@@ -597,6 +597,13 @@ def _run_job(job):
         if ((o["range_end"] or meta["duration"]) - (o["range_start"] or 0)) > config.MAX_VIDEO_HOURS * 3600:
             raise RuntimeError(f"That is longer than {config.MAX_VIDEO_HOURS:g} hours. Choose a shorter part of it under Options.")
         if meta["is_live"]:
+            if job.get("creator"):
+                c = creators.get(job["creator"])
+                if c and not live.active_for(c["id"]):
+                    print(f"[PeakCut] [JOBS] Live stream detected for {c['name']}: Auto-handing off to live recorder", flush=True)
+                    live.start_session(c, src["url"])
+                    _set(job, status="done", stage="Handed off to live stream recording")
+                    return
             raise RuntimeError("This link is a live stream, so it would never finish downloading. Open the creator, "
                                "put this link under Setup, and press Start recording instead.")
         _set(job, title=meta["title"], uploader=meta["uploader"], duration=meta["duration"])
