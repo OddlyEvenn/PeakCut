@@ -140,9 +140,10 @@ def enqueue(job, clip, account_ids, now=False) -> list:
                 continue
             due = time.time() if now else _next_slot(aid, c.get("post_gap_min", 45), c.get("daily_cap", 7))
             src_url = job.get("source", {}).get("url") or job.get("source", {}).get("name") or job.get("title") or ""
+            p_title = _polish_post_title(clip.get("title") or clip.get("hook") or "Clip", clip, job)
             p = {"id": secrets.token_hex(8), "user": ctx.uid(), "job": job["id"], "clip": clip["id"], "creator": job["creator"],
                  "account": aid, "account_name": acc["name"], "platform": acc["platform"], "status": "scheduled",
-                 "due_at": due, "created": time.time(), "title": clip.get("title") or clip.get("hook") or "Clip",
+                 "due_at": due, "created": time.time(), "title": p_title,
                  "score": clip.get("score", 0), "tries": 0, "url": "", "remote_id": "", "error": None, "views": None,
                  "source_url": src_url, "source_start": clip.get("start", 0.0), "source_end": clip.get("end", 0.0)}
             _posts.append(p)
@@ -167,9 +168,37 @@ def on_clip_ready(job, clip):
         creators.log(c["id"], f"Queued for {len(made)} account(s): {clip.get('title') or clip.get('hook')}")
 
 
+def _polish_post_title(raw_title, clip, job=None):
+    """Ensure titles sent to YouTube/TikTok/Instagram are high-CTR curiosity hooks, never dry summaries."""
+    t = (raw_title or "").strip()
+    low = t.lower()
+    hook = (clip.get("hook") or "").strip() if clip else ""
+    job_title = (job.get("title") or "").lower() if job else ""
+
+    if "first store robbery" in low:
+        return "Lucia's First Store Robbery Went Terribly Wrong... 😱💀"
+    if "final ride" in low:
+        return "He Thought He Escaped Lucia In GTA 6... 💀🚗"
+    if "sharp turn" in low:
+        return "Bro Pulled Off The Cleanest Drift In GTA 6 History 🔥🤯"
+    if low in ("loud moment", "wait for it", "clip", "untitled", ""):
+        if "gta" in job_title or "gta" in low or "gta" in hook.lower():
+            return "The Craziest Moment In GTA 6 Today 😱🔥"
+        return "The Entire Stream Went Silent After This... 😱🔥"
+
+    if t.isupper() and len(t.split()) <= 3:
+        if "gta" in job_title or "gta" in hook.lower():
+            return "Bro Was NOT Ready For This In GTA 6 😭🔥"
+        return f"{t.title()}... You Won't Believe The Ending! 😱"
+
+    if not any(ord(ch) > 0x2000 for ch in t) and not t.endswith(("?!", "!", "...")):
+        return f"{t}?! 😱🔥"
+    return t
+
+
 def _caption(clip, creator):
     raw_tags = list(clip.get("hashtags", []))
-    core_tags = ["Shorts", "Viral", "Trending", "FYP", "YouTubeShorts"]
+    core_tags = ["Shorts", "Viral", "Trending", "FYP", "YouTubeShorts", "GamingShorts"]
     for ct in core_tags:
         if ct.lower() not in {t.lower() for t in raw_tags}:
             raw_tags.append(ct)
@@ -181,8 +210,11 @@ def _caption(clip, creator):
 
     parts = []
     desc = (clip.get("description") or "").strip()
-    if desc:
-        parts.append(desc)
+    if desc and not desc.endswith("👇") and "?" not in desc:
+        desc += "\n\n💬 Did you see that coming?! What would you have done here? Drop your thoughts below! 👇"
+    elif not desc:
+        desc = "You won't believe what happened in this crazy moment! 🤯 Watch till the very end to see the reaction.\n\n💬 Did you see that coming? Drop your thoughts below! 👇"
+    parts.append(desc)
     parts.append("🔥 Drop a like and subscribe for daily viral clips!\n💬 What do you think about this? Let us know below! 👇")
     if creator.get("post_footer"):
         parts.append(creator["post_footer"])
@@ -212,7 +244,8 @@ def _post(p):
             raise RuntimeError("That account was disconnected.")
         path = Path(job["dir"]) / "clips" / clip["file"]
         creator = creators.get(job["creator"]) or dict(creators.DEFAULTS, name="clips")
-        title = clip.get("title") or clip.get("hook") or "Must Watch Clip! 🔥"
+        raw_title = clip.get("title") or clip.get("hook") or "Must Watch Clip! 🔥"
+        title = _polish_post_title(raw_title, clip, job)
         if acc["platform"] == "youtube" and "#shorts" not in title.lower() and len(title) <= 90:
             title = f"{title} #Shorts"
         cap = _caption(clip, creator)
