@@ -5,6 +5,7 @@ import time
 from pathlib import Path
 
 import json
+import re
 
 from . import accounts, alerts, config, creators, ctx, jobs, live
 
@@ -45,6 +46,8 @@ def _day(t):
 
 def _mirror(p):
     """Copy the post's state onto its clip so the clip card can show it."""
+    if not p.get("job"):
+        return
     job = jobs.get(p["job"])
     clip = next((c for c in job["clips"] if c["id"] == p["clip"]), None) if job else None
     if clip is not None:
@@ -52,16 +55,76 @@ def _mirror(p):
         jobs.save(job)
 
 
-def _next_slot(account_id, gap_min, cap):
-    """Earliest time that respects the gap between posts and the daily cap for this account."""
-    mine = [p for p in _mine() if p["account"] == account_id and p["status"] in OPEN + ("posted",)]
-    t = max(time.time(), max((p.get("posted_at") or p["due_at"] for p in mine), default=0) + gap_min * 60)
-    for _ in range(30):
-        if sum(1 for p in mine if _day(p.get("posted_at") or p["due_at"]) == _day(t)) < cap:
-            break
-        lt = time.localtime(t + 86400)
-        t = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 9, 0, 0, 0, 0, -1))  # 9:00 next day
-    return t
+# 7 fixed daily publication slots in 24h format: 12 AM, 2 AM, 8 AM, 12 PM, 4 PM, 8 PM, 10 PM
+SCHEDULED_SLOTS = [(0, 0), (2, 0), (8, 0), (12, 0), (16, 0), (20, 0), (22, 0)]
+GRACE_SECONDS = 180  # Don't schedule into a slot that begins in less than 3 minutes
+
+
+def _next_slot(account_id, gap_min=45, cap=7):
+    """Earliest fixed time slot (12 AM, 2 AM, 8 AM, 12 PM, 4 PM, 8 PM, 10 PM) for this account."""
+    now = time.time()
+    acc_posts = [p for p in _posts if p.get("account") == account_id and p.get("status") in OPEN + ("posted",)]
+    claimed_times = {int(p.get("posted_at") or p.get("due_at", 0)) for p in acc_posts}
+
+    for day_idx in range(30):
+        base_time = now + day_idx * 86400
+        lt = time.localtime(base_time)
+        day_str = time.strftime("%Y-%m-%d", lt)
+        day_count = sum(1 for p in acc_posts if _day(p.get("posted_at") or p.get("due_at", 0)) == day_str)
+        if day_count >= cap:
+            continue
+
+        for h, m in SCHEDULED_SLOTS:
+            slot_t = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, h, m, 0, 0, 0, -1))
+            if slot_t < now + GRACE_SECONDS:
+                continue
+            if any(abs(slot_t - ct) < 300 for ct in claimed_times):
+                continue
+            return slot_t
+
+    return now + 86400 * 30
+
+
+def _rebalance_account_queue(account_id):
+    """Sort pending scheduled clips for this account by AI score descending so highest-scoring clips get earliest slots."""
+    now = time.time()
+    with _lock:
+        pending = [p for p in _posts if p.get("account") == account_id and p.get("status") == "scheduled"
+                   and p.get("due_at", 0) > now + GRACE_SECONDS]
+        if len(pending) <= 1:
+            return
+        slots = sorted(p["due_at"] for p in pending)
+        pending.sort(key=lambda p: (-p.get("score", 0), p.get("created", 0)))
+        changed = False
+        for slot_time, p in zip(slots, pending):
+            if p["due_at"] != slot_time:
+                p["due_at"] = slot_time
+                changed = True
+                _mirror(p)
+        if changed:
+            _save()
+            print(f"[PeakCut] [POSTING] Rebalanced {len(pending)} pending posts for account {account_id} by AI score", flush=True)
+
+
+def _is_duplicate_clip(job, clip, account_id) -> bool:
+    """Check if this clip or an overlapping segment from the same video has already been queued/posted to this account."""
+    src = job.get("source", {}).get("url") or job.get("source", {}).get("name") or job.get("title") or ""
+    start, end = clip.get("start", 0.0), clip.get("end", 0.0)
+    dur = max(1.0, end - start)
+
+    for p in _posts:
+        if p.get("account") != account_id or p.get("status") not in OPEN + ("posted",):
+            continue
+        if p.get("job") == job["id"] and p.get("clip") == clip["id"]:
+            return True
+        p_src = p.get("source_url") or ""
+        p_start = p.get("source_start")
+        p_end = p.get("source_end")
+        if src and p_src and src == p_src and p_start is not None and p_end is not None:
+            overlap = max(0.0, min(end, p_end) - max(start, p_start))
+            if (overlap / dur > 0.4) or abs(start - p_start) < 15:
+                return True
+    return False
 
 
 def enqueue(job, clip, account_ids, now=False) -> list:
@@ -72,16 +135,20 @@ def enqueue(job, clip, account_ids, now=False) -> list:
             acc = accounts.get(aid)
             if not acc:
                 continue
-            if any(p["job"] == job["id"] and p["clip"] == clip["id"] and p["account"] == aid
-                   and p["status"] in OPEN + ("posted",) for p in _mine()):
-                continue  # never post the same clip to the same account twice
-            due = time.time() if now else _next_slot(aid, c["post_gap_min"], c["daily_cap"])
+            if _is_duplicate_clip(job, clip, aid):
+                print(f"[PeakCut] [POSTING] Duplicate clip skipped for {acc['name']}: {clip.get('title') or clip.get('id')}", flush=True)
+                continue
+            due = time.time() if now else _next_slot(aid, c.get("post_gap_min", 45), c.get("daily_cap", 7))
+            src_url = job.get("source", {}).get("url") or job.get("source", {}).get("name") or job.get("title") or ""
             p = {"id": secrets.token_hex(8), "user": ctx.uid(), "job": job["id"], "clip": clip["id"], "creator": job["creator"],
                  "account": aid, "account_name": acc["name"], "platform": acc["platform"], "status": "scheduled",
                  "due_at": due, "created": time.time(), "title": clip.get("title") or clip.get("hook") or "Clip",
-                 "score": clip.get("score", 0), "tries": 0, "url": "", "remote_id": "", "error": None, "views": None}
+                 "score": clip.get("score", 0), "tries": 0, "url": "", "remote_id": "", "error": None, "views": None,
+                 "source_url": src_url, "source_start": clip.get("start", 0.0), "source_end": clip.get("end", 0.0)}
             _posts.append(p)
             made.append(p)
+            if not now:
+                _rebalance_account_queue(aid)
         _save()
     for p in made:
         _mirror(p)
@@ -101,14 +168,43 @@ def on_clip_ready(job, clip):
 
 
 def _caption(clip, creator):
-    tags = " ".join("#" + h for h in clip.get("hashtags", []))
-    return "\n\n".join(x for x in (clip.get("description", ""), tags, creator.get("post_footer", "")) if x)
+    raw_tags = list(clip.get("hashtags", []))
+    core_tags = ["Shorts", "Viral", "Trending", "FYP", "YouTubeShorts"]
+    for ct in core_tags:
+        if ct.lower() not in {t.lower() for t in raw_tags}:
+            raw_tags.append(ct)
+    if creator.get("name"):
+        c_tag = re.sub(r"\W", "", creator["name"])
+        if c_tag and c_tag.lower() not in {t.lower() for t in raw_tags}:
+            raw_tags.append(c_tag)
+    tag_str = " ".join("#" + h for h in raw_tags[:15])
+
+    parts = []
+    desc = (clip.get("description") or "").strip()
+    if desc:
+        parts.append(desc)
+    parts.append("🔥 Drop a like and subscribe for daily viral clips!\n💬 What do you think about this? Let us know below! 👇")
+    if creator.get("post_footer"):
+        parts.append(creator["post_footer"])
+    elif creator.get("name"):
+        parts.append(f"Clipped from {creator['name']}")
+    parts.append(tag_str)
+    return "\n\n".join(parts)
 
 
 def _post(p):
     job = jobs.get(p["job"])
     clip = next((c for c in job["clips"] if c["id"] == p["clip"]), None) if job else None
     acc = accounts.get(p["account"])
+    from . import circuit_breaker, cleanup
+    if acc and acc.get("platform") == "youtube" and circuit_breaker.youtube.is_open():
+        cb_st = circuit_breaker.youtube.status()
+        print(f"[PeakCut] [POSTING] YouTube circuit breaker is OPEN: {cb_st['reason']}", flush=True)
+        p.update(status="scheduled", due_at=time.time() + min(cb_st.get("cooldown_seconds", 1800), 1800))
+        _save()
+        _mirror(p)
+        return
+
     try:
         if not clip or clip.get("status") != "done":
             raise RuntimeError("The clip no longer exists or is not finished.")
@@ -116,9 +212,14 @@ def _post(p):
             raise RuntimeError("That account was disconnected.")
         path = Path(job["dir"]) / "clips" / clip["file"]
         creator = creators.get(job["creator"]) or dict(creators.DEFAULTS, name="clips")
-        title, cap = clip.get("title") or clip.get("hook") or "Clip", _caption(clip, creator)
+        title = clip.get("title") or clip.get("hook") or "Must Watch Clip! 🔥"
+        if acc["platform"] == "youtube" and "#shorts" not in title.lower() and len(title) <= 90:
+            title = f"{title} #Shorts"
+        cap = _caption(clip, creator)
+        print(f"[PeakCut] [POSTING] Uploading clip '{title}' to {acc['platform']} ({acc['name']})...", flush=True)
         if acc["platform"] == "youtube":
-            rid, url = accounts.youtube_upload(acc, path, title, cap + "\n\n#Shorts", clip.get("hashtags", []), creator["privacy"])
+            rid, url = accounts.youtube_upload(acc, path, title, cap, clip.get("hashtags", []), creator["privacy"])
+            circuit_breaker.youtube.record_success()
         elif acc["platform"] == "instagram":
             rid, url = accounts.instagram_upload(acc, path, f"{title}\n\n{cap}", job["id"])
         elif acc["platform"] == "tiktok":
@@ -127,7 +228,12 @@ def _post(p):
             raise RuntimeError("That kind of account is no longer supported.")
         p.update(status="posted", posted_at=time.time(), remote_id=rid, url=url, error=None)
         creators.log(p["creator"], f"Posted to {acc['name']}: {title}")
+        print(f"[PeakCut] [POSTING] Successfully posted to {acc['name']}: {url}", flush=True)
+        cleanup.prune_posted_clip(p["job"], p["clip"])
     except Exception as e:  # noqa: BLE001
+        print(f"[PeakCut] [POSTING ERROR] Upload to {acc.get('name') if acc else p.get('account_name')} failed: {e}", flush=True)
+        if acc and acc.get("platform") == "youtube":
+            circuit_breaker.youtube.record_error(str(e))
         p["tries"] += 1
         p["error"] = str(e)[-300:]
         if p["tries"] < 3 and clip and acc:

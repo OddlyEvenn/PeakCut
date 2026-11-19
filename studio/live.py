@@ -573,6 +573,7 @@ class Session:
         self.n += 1
         c.update(id=f"clip{self.n:03d}", style=self.settings["style"], layout=self.settings["layout"],
                  captions=self.job["options"].get("captions", True), status="queued", version=0, made_at=time.time())
+        print(f"[PeakCut] [LIVE] Highlight found! Clip {c['id']} (Score: {c.get('score')}) | Hook: '{c.get('hook')}' | Title: '{c.get('title')}'", flush=True)
         with self.lock:
             self.job["clips"].append(c)
         jobs.save(self.job)
@@ -799,6 +800,7 @@ def start_session(creator: dict, url=None) -> dict:
                       creator=creator["id"], kind="live")
     job.update(status="live", stage="Connecting to the stream")
     jobs.save(job)
+    print(f"\n[PeakCut] [LIVE] Started recording session for creator '{creator.get('name')}' -> {url}", flush=True)
     Session(job, creator).start()
     return job
 

@@ -57,10 +57,10 @@ Rules:
 - Do not pick intros, sponsor reads, "like and subscribe", or dead air.
 - Skip weak moments. Fewer strong clips beat many weak ones. Return [] if nothing is worth clipping.
 - score: 0-100, how likely a stranger keeps watching. Be honest; most clips are 50-80.
-- hook: at most 5 words, ALL CAPS, shown as big text on the video. Curiosity, but true to what happens.
-- title: at most 70 characters, for the post.
-- description: one or two sentences.
-- hashtags: 5 tags without the # sign.
+- hook: at most 5 words, ALL CAPS, shown as big text on the video. Intense curiosity, but true to what happens.
+- title: high-CTR viral title (max 75 chars) designed to stop the scroll. Use intense curiosity gaps, emotional triggers, punchy reactions, and 1-2 relevant emojis (e.g. "HE ACTUALLY DID THIS?! 😱", "Bro Lost His Mind Here 💀🔥", "Wait for the ending... 😂"). Avoid dry or robotic summaries.
+- description: 2-3 engaging, suspenseful sentences that hook the reader without spoiling the ending, plus a thought-provoking question to drive comments.
+- hashtags: 8 to 12 high-reach viral hashtags without the # sign (combining viral tags like Shorts, Viral, Trending, FYP, YouTubeShorts, Gaming with specific tags about the game or creator).
 - highlight_words: 3 to 6 single words spoken in the clip that carry the punch.
 - Write hook, title, description, hashtags and highlight_words in English. If the video is in Hindi or Urdu,
   you may write them the way people type Hindi and Urdu in Roman letters (Hinglish: "yaar ye kya hai"), never
@@ -134,7 +134,7 @@ def _tidy(c, s, e, game=None):
         "category": cat if cat in CATEGORIES else "other",
         "hook": roman.to_roman(_text(c.get("hook"), 60)).upper(), "title": roman.to_roman(_text(c.get("title"), 100)),
         "description": roman.to_roman(_text(c.get("description"), 300)),
-        "hashtags": [t for t in tags if t][:8],
+        "hashtags": [t for t in tags if t][:15],
         "highlight_words": [roman.to_roman(_text(h, 30)) for h in words][:8],
         "reason": _text(c.get("reason"), 200),
     }
@@ -181,25 +181,59 @@ def loud_zscore(db):
 
 
 def ask_ai(prompt, schema=None, purpose="AI call", timeout=None):
-    """Try each model in order, with a couple of retries for rate limits and overloads.
+    """Try each target and key in the failover cascade in priority order.
     Returns (the answer, the model that gave it, tokens used) and notes the tokens in the usage record."""
-    if not config.ai_ready():
+    if not config.ai_ready() and not bool(ai.get_cascade()):
         raise RuntimeError("The AI is not set up on this server.")
+
+    cascade = ai.get_cascade()
+    if not cascade:
+        # Fall back to single current configuration
+        c = ai.current()
+        cascade = [{"provider": c["provider"], "label": ai.label(), "key": c["key"],
+                    "models": c["models"] or [""], "base_url": ai.base_url()}]
+
+    # Try keys that are NOT currently on cooldown first
+    ready_targets = [t for t in cascade if not ai.is_key_on_cooldown(t.get("key", ""))]
+    cooldown_targets = [t for t in cascade if ai.is_key_on_cooldown(t.get("key", ""))]
+    ordered_targets = ready_targets + cooldown_targets
+
     last = None
-    for model in ai.models():
-        for attempt in range(3):
-            try:
-                out, sent, wrote = ai.call(model, prompt, schema or SCHEMA, timeout)
-                usage.record(sent, wrote, purpose)
-                ai.clear_problem()
-                return out, model, sent + wrote
-            except Exception as e:  # noqa: BLE001
-                last = e
-                if "HTTP 429" in str(e) or "HTTP 5" in str(e):
-                    time.sleep(4 * (attempt + 1))
-                    continue
-                break
+    for target in ordered_targets:
+        prov = target["provider"]
+        k = target["key"]
+        k_hint = (k[-4:] if len(k) >= 8 else "...") if k else "none"
+        models = target["models"]
+        base = target["base_url"]
+        label = target.get("label") or prov.title()
+
+        for model in models:
+            for attempt in range(2):
+                try:
+                    print(f"  [PeakCut] [AI] Calling {label} ({model}) [key ...{k_hint}]...", flush=True)
+                    out, sent, wrote = ai.call(model, prompt, schema or SCHEMA, timeout,
+                                               provider_id=prov, key_val=k, base=base)
+                    usage.record(sent, wrote, purpose)
+                    ai.clear_problem()
+                    ai.clear_key_cooldown(k)
+                    print(f"  [PeakCut] [AI] Success: {label} ({model}) responded ({sent + wrote} tokens).", flush=True)
+                    return out, model, sent + wrote
+                except Exception as e:  # noqa: BLE001
+                    last = e
+                    err_str = str(e)
+                    low = err_str.lower()
+                    if "429" in err_str or "rate limit" in low:
+                        ai.mark_key_cooldown(k, 60.0)
+                        print(f"  [PeakCut] [AI FAILOVER] {label} [key ...{k_hint}] rate limited (429). Cooldown 60s. Switching to next key/provider...", flush=True)
+                    elif "402" in err_str or "quota" in low or "credits" in low or "token" in low:
+                        ai.mark_key_cooldown(k, 300.0)
+                        print(f"  [PeakCut] [AI FAILOVER] {label} [key ...{k_hint}] quota/token limit reached: {err_str[:120]}. Switching to next key/provider...", flush=True)
+                    else:
+                        print(f"  [PeakCut] [AI FAILOVER] {label} ({model}) [key ...{k_hint}] error: {err_str[:120]}. Trying fallback...", flush=True)
+                    break
+
     ai.note_problem(last)
+    print(f"  [PeakCut] [AI ERROR] All AI cascade targets failed! Last error: {last}", flush=True)
     raise RuntimeError(f"The AI did not answer: {ai.explain(last) or last}")
 
 

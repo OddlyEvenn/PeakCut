@@ -374,6 +374,7 @@ def render_one(job, clip, words):
     d = Path(job["dir"])
     clip["status"] = "rendering"
     save(job)
+    print(f"  [PeakCut] [CLIP] Rendering {clip['id']} for job {job['id']}: [{clip.get('start', 0):.1f}s - {clip.get('end', 0):.1f}s] '{clip.get('title') or clip.get('hook') or ''}'", flush=True)
     try:
         if not clip.get("src") and not job.get("source_path"):
             _piece_again(job, clip)
@@ -387,6 +388,7 @@ def render_one(job, clip, words):
         clip.update(out, status="done", version=clip.get("version", 0) + 1, error=None)
         post = {k: clip[k] for k in ("title", "description", "hashtags", "hook", "start", "end", "score")}
         (d / "clips" / f"{clip['id']}.json").write_text(json.dumps(post, indent=1), encoding="utf-8")
+        print(f"  [PeakCut] [CLIP] {clip['id']} ready -> {clip.get('file')}", flush=True)
         if clip["version"] == 1:
             clip.setdefault("made_at", time.time())
             creators.log(job["creator"], f"Clip ready (score {clip['score']}): {clip['title'] or clip['hook']}")
@@ -397,6 +399,8 @@ def render_one(job, clip, words):
                 except Exception:  # noqa: BLE001
                     traceback.print_exc()
     except Exception as e:  # noqa: BLE001
+        print(f"  [PeakCut] [CLIP ERROR] {clip['id']} failed: {e}", flush=True)
+        traceback.print_exc()
         clip.update(status="error", error=safe.friendly(e, 400))
         creators.log(job["creator"], f"Clip failed: {safe.friendly(e, 200)}")
     save(job)
@@ -566,6 +570,7 @@ def _run_job(job):
     face = False       # where the webcam is in the source, found once; False means not looked for yet
     usage.set_context(job["creator"], job["title"] or src.get("name"))
     resuming = bool(job.pop("resume", False)) and (d / "words.json").is_file()
+    print(f"\n[PeakCut] [JOB {job['id']}] Processing started: '{job.get('title') or src.get('name') or 'Video'}' (source: {src.get('type')})", flush=True)
     if resuming:   # after a restart: keep the transcript parts, clips and AI answers already made, and carry on
         _set(job, status="running", stage="Picking up where it stopped", error=None)
     else:
@@ -611,6 +616,7 @@ def _run_job(job):
         audio_file.unlink(missing_ok=True)
     if not job["duration"]:
         job["duration"] = len(audio) / 16000
+    print(f"[PeakCut] [JOB {job['id']}] Audio ready: duration {round(job['duration'])}s ({round(job['duration']/60, 1)} min)", flush=True)
     lo = int((o["range_start"] or 0) * 16000)
     hi = min(len(audio), int(o["range_end"] * 16000)) if o["range_end"] else len(audio)
     span = (hi - lo) / 16000
@@ -727,6 +733,7 @@ def _run_job(job):
         _set(job, progress=max(job["progress"], 0.14 + 0.78 * (b - lo) / max(1, hi - lo)))
         words += [dict(w, s=round(w["s"] + shift, 2), e=round(w["e"] + shift, 2)) for w in bw]
         (d / "words.json").write_text(json.dumps(words), encoding="utf-8")
+        print(f"[PeakCut] [JOB {job['id']}] Block {bi + 1}/{len(blocks)} transcribed ({len(words)} words total)", flush=True)
         _set(job, stage="Finding the best moments" + where, word_count=len(words))
         left = int(o["max_clips"]) - len(job["clips"])
         if left <= 0 or len(bw) < 8:
@@ -735,12 +742,14 @@ def _run_job(job):
             continue
         quota = max(1, math.ceil(left / (len(blocks) - bi)))
         s0 = int((a - lo) / 16000)
+        print(f"[PeakCut] [JOB {job['id']}] Block {bi + 1}/{len(blocks)}: Asking AI for up to {quota} clips...", flush=True)
         found, ai = brain.find_clips(bw, db[s0: s0 + int((b - a) / 16000) + 1], (b - a) / 16000, job["title"],
                                      job["uploader"], quota, int(o["min_len"]), int(o["max_len"]), notes.append, game=game)
         tokens += ai.get("tokens", 0)
         model = ai.get("model") or model
         if ai.get("note"):
             notes.append(ai["note"])
+        print(f"[PeakCut] [JOB {job['id']}] Block {bi + 1}/{len(blocks)}: AI found {len(found)} candidate clips", flush=True)
         if found and statics:
             # A commercial or a "be right back" slate is not a clip. Any clip that sits mostly inside one
             # is dropped.
@@ -784,7 +793,14 @@ def _run_job(job):
     job["ai"] = {"model": model, "tokens": tokens, "log": notes[-5:],
                  "note": "The AI was unavailable, so clips were picked by loudness only." if clips and not model else ""}
     stage = "Done" if clips else "Done, but nothing clip-worthy was found"
-    _set(job, status="done", stage=stage, progress=1.0, took=round(time.time() - t0))
+    took_sec = round(time.time() - t0)
+    print(f"\n[PeakCut] [JOB {job['id']}] COMPLETED in {took_sec}s! {len(clips)} clip(s) ready.\n", flush=True)
+    _set(job, status="done", stage=stage, progress=1.0, took=took_sec)
+    try:
+        from . import cleanup
+        cleanup.prune_source_video(job["id"])
+    except Exception:
+        pass
     try:
         from . import notices
         name = job.get("title") or job["source"].get("name") or "your video"
@@ -792,7 +808,7 @@ def _run_job(job):
                     name, f"/app/creators/{job['creator']}" if job.get("creator") else "/app/videos")
     except Exception:  # noqa: BLE001
         pass
-    creators.log(job["creator"], f"Video finished with {len(clips)} clips in {round(time.time() - t0)}s: {job['title']}")
+    creators.log(job["creator"], f"Video finished with {len(clips)} clips in {took_sec}s: {job['title']}")
 
 
 def _worker(quick_only=False):
@@ -820,6 +836,8 @@ def _worker(quick_only=False):
                     words = json.loads((Path(job["dir"]) / "words.json").read_text(encoding="utf-8"))
                 render_one(job, clip, words)
         except Exception as e:  # noqa: BLE001
+            print(f"\n[PeakCut] [JOB ERROR] [{a}] Failure: {e}", flush=True)
+            traceback.print_exc()
             (Path(job["dir"]) / "error.log").write_text(traceback.format_exc(), encoding="utf-8")
             if kind == "job":
                 for c in job["clips"]:

@@ -72,6 +72,10 @@ def _startup():
     jobs.start()
     live.start()
     posting.start()
+    from . import stream_poller
+    stream_poller.start()
+    from . import cleanup
+    cleanup.start()
     from . import updates
     updates.start()                  # looks for a newer PeakCut every minute, in the background
 
@@ -205,6 +209,12 @@ class Gate:
                 if quick is not None:
                     return await JSONResponse(quick)(scope, receive, send_with_headers)
             await self.inner(scope, receive, send_with_headers)
+        except Exception as e:
+            if not isinstance(e, HTTPException):
+                import traceback
+                print(f"[PeakCut] [SERVER ERROR] {method} {path} error: {e}", flush=True)
+                traceback.print_exc()
+            raise
         finally:
             ctx._uid.reset(token)
 
@@ -1200,6 +1210,17 @@ def edit_creator(cid: str, body: dict = Body(...)):
     return c
 
 
+@app.post("/api/creators/{cid}/check")
+def check_streams(cid: str):
+    _need_verified()
+    c = creators.get(cid)
+    if not c:
+        raise HTTPException(404, "No such creator")
+    from . import stream_poller
+    new_jobs = stream_poller.check_creator_streams(cid)
+    return {"checked": True, "new_jobs": [j["id"] for j in new_jobs]}
+
+
 @app.post("/api/creators/{cid}/live")
 def go_live(cid: str, body: dict = Body(default={})):
     _need_verified()
@@ -1541,17 +1562,21 @@ def admin_delete_user(request: Request, uid: str, body: dict = Body(...)):
 
 
 def main():
-    print(f"\n  PeakCut is running:  {config.PUBLIC_URL}\n")
+    print(f"\n==================================================================")
+    print(f"  PeakCut is running:  {config.PUBLIC_URL}")
+    print(f"  Terminal logging: ENABLED (requests, jobs & errors show here)")
+    print(f"==================================================================\n", flush=True)
     if not config.ACCOUNTS and (config.HTTPS or config.HOST not in ("127.0.0.1", "localhost", "::1")):
         print("  Sign-in is off, so anyone who can reach this address can use PeakCut and its AI key.\n"
               "  On a server other people can reach, set PEAKCUT_ACCOUNTS=1 in .env.\n", flush=True)
+    log_level = config.env("PEAKCUT_LOG_LEVEL", "info")
     if config.env("PEAKCUT_AUTO_RELOAD") == "1":
         # restart by itself whenever the server code changes (pages in web/ never need a restart)
-        uvicorn.run("studio.server:app", host=config.HOST, port=config.PORT, log_level="warning", backlog=4096, reload=True,
+        uvicorn.run("studio.server:app", host=config.HOST, port=config.PORT, log_level=log_level, backlog=4096, reload=True,
                     reload_dirs=[str(config.ROOT / "studio")], reload_includes=["*.py"],
                     proxy_headers=bool(config.env("PEAKCUT_TRUST_PROXY")), forwarded_allow_ips="*")
         return
-    uvicorn.run(app, host=config.HOST, port=config.PORT, log_level="warning", backlog=4096,
+    uvicorn.run(app, host=config.HOST, port=config.PORT, log_level=log_level, backlog=4096,
                 proxy_headers=bool(config.env("PEAKCUT_TRUST_PROXY")), forwarded_allow_ips="*")
 
 

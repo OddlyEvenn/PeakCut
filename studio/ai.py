@@ -96,6 +96,154 @@ def ready() -> bool:
     return bool(c["provider"] in PROVIDERS and c["models"] and base_url() and (c["key"] or c["provider"] in NO_KEY))
 
 
+DEFAULT_MODELS = {
+    "groq": ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "llama-3.3-70b-versatile"],
+    "gemini": ["gemini-3.5-flash-lite", "gemini-3.8-flash", "gemini-2.5-flash"],
+    "openrouter": ["google/gemini-2.5-flash", "meta-llama/llama-3.3-70b-instruct"],
+    "openai": ["gpt-4o-mini", "gpt-4o"],
+    "anthropic": ["claude-3-5-haiku-20241022"],
+    "xai": ["grok-4"],
+    "ollama": ["llama3.1"],
+    "custom": ["custom"],
+}
+
+_key_cooldowns: dict = {}
+
+
+def is_key_on_cooldown(k: str) -> bool:
+    import time
+    if not k:
+        return False
+    return time.time() < _key_cooldowns.get(k, 0.0)
+
+
+def mark_key_cooldown(k: str, seconds: float = 60.0):
+    import time
+    if k:
+        _key_cooldowns[k] = time.time() + seconds
+
+
+def clear_key_cooldown(k: str):
+    _key_cooldowns.pop(k, None)
+
+
+def get_cascade() -> list:
+    """Returns a list of target dicts for multi-key and multi-provider failover:
+    [
+        {"provider": "groq", "label": "Groq", "key": "...", "models": [...], "base_url": "..."},
+        ...
+    ]
+    """
+    targets = []
+    seen = set()
+
+    # If AI was explicitly turned off in environment (e.g. in test suite)
+    if config.env("PEAKCUT_AI_KEY") == "" and config.env("PEAKCUT_AI_MODELS") == "":
+        return []
+
+    # 1. Dashboard setting takes top priority if saved
+    d = _from_dashboard()
+    if d.get("provider"):
+        dp = ALIASES.get(str(d["provider"]).lower(), str(d["provider"]).lower())
+        d_keys = [k.strip() for k in str(d.get("key") or "").split(",") if k.strip()]
+        if not d_keys and dp in NO_KEY:
+            d_keys = [""]
+        d_models = list(d.get("models") or []) or DEFAULT_MODELS.get(dp, [""])
+        d_base = (str(d.get("base_url") or "")).rstrip("/") or PROVIDERS.get(dp, ("", ""))[1]
+        for dk in d_keys:
+            combo = (dp, dk)
+            if combo not in seen:
+                seen.add(combo)
+                targets.append({
+                    "provider": dp,
+                    "label": PROVIDERS.get(dp, (dp.title(),))[0],
+                    "key": dk,
+                    "models": d_models,
+                    "base_url": d_base,
+                })
+
+    # 2. Determine provider order
+    first = ALIASES.get((config.AI_PROVIDER or "").lower(), (config.AI_PROVIDER or "").lower())
+    env_cascade = config.env("PEAKCUT_AI_CASCADE") or config.env("PEAKCUT_AI_PROVIDERS") or ""
+    if env_cascade:
+        prov_order = [ALIASES.get(p.strip().lower(), p.strip().lower()) for p in env_cascade.split(",") if p.strip()]
+        if first and first in PROVIDERS and first != prov_order[0]:
+            if first in prov_order:
+                prov_order.remove(first)
+            prov_order.insert(0, first)
+    else:
+        prov_order = [first] if (first and first in PROVIDERS) else []
+        for p in ("groq", "gemini", "openrouter", "openai", "anthropic", "xai", "ollama", "custom"):
+            if p not in prov_order:
+                prov_order.append(p)
+
+    for p in prov_order:
+        if p not in PROVIDERS:
+            continue
+        up = p.upper()
+        keys = []
+
+        # If primary provider in .env/config, prioritize config.ai_key()
+        if p == ALIASES.get((config.AI_PROVIDER or "").lower(), (config.AI_PROVIDER or "").lower()):
+            raw_k = config.ai_key()
+            if raw_k:
+                for k in raw_k.split(","):
+                    if k.strip() and k.strip() not in keys:
+                        keys.append(k.strip())
+
+        # Provider-specific keys: e.g. GROQ_API_KEYS, PEAKCUT_GROQ_KEYS
+        env_keys = (config.env(f"PEAKCUT_{up}_KEYS") or config.env(f"{up}_API_KEYS") or
+                    config.env(f"PEAKCUT_{up}_KEY") or config.env(f"{up}_API_KEY") or "")
+        for k in env_keys.split(","):
+            if k.strip() and k.strip() not in keys:
+                keys.append(k.strip())
+
+        # Numbered keys: GROQ_API_KEY_1, GROQ_API_KEY_2, etc.
+        for i in range(1, 10):
+            nk = config.env(f"{up}_API_KEY_{i}") or config.env(f"PEAKCUT_{up}_KEY_{i}")
+            if nk and nk.strip() and nk.strip() not in keys:
+                keys.append(nk.strip())
+
+        if not keys:
+            # Only include NO_KEY providers if they were explicitly configured by the user
+            if p in NO_KEY and (p == ALIASES.get((config.AI_PROVIDER or "").lower(), "") or p in (env_cascade.lower())):
+                keys = [""]
+            else:
+                continue
+
+        # Models
+        if p == ALIASES.get((config.AI_PROVIDER or "").lower(), (config.AI_PROVIDER or "").lower()) and config.AI_MODELS:
+            p_models = list(config.AI_MODELS)
+        else:
+            m_raw = config.env(f"PEAKCUT_{up}_MODELS") or config.env(f"{up}_MODELS") or ""
+            if m_raw:
+                p_models = [m.strip() for m in m_raw.split(",") if m.strip()]
+            else:
+                p_models = list(DEFAULT_MODELS.get(p, []))
+
+        # Base URL
+        p_base = (config.env(f"PEAKCUT_{up}_BASE_URL") or config.env(f"{up}_BASE_URL") or "").rstrip("/")
+        if not p_base:
+            if p == ALIASES.get((config.AI_PROVIDER or "").lower(), (config.AI_PROVIDER or "").lower()) and config.AI_BASE_URL:
+                p_base = config.AI_BASE_URL.rstrip("/")
+            else:
+                p_base = PROVIDERS.get(p, ("", ""))[1]
+
+        for k in keys:
+            combo = (p, k)
+            if combo not in seen:
+                seen.add(combo)
+                targets.append({
+                    "provider": p,
+                    "label": PROVIDERS.get(p, (p.title(),))[0],
+                    "key": k,
+                    "models": p_models,
+                    "base_url": p_base,
+                })
+
+    return targets
+
+
 def public() -> dict:
     """What the settings page may see. The key itself never leaves the server: only whether there is one, and
     its last four characters so the owner can tell which key it is."""
@@ -212,8 +360,9 @@ def clear_problem():
     problem.update(text="", at=0.0)
 
 
-def _fail(r, model):
-    text = r.text[:300].replace(key() or "\0", "<key>")
+def _fail(r, model, use_key=None):
+    k = use_key if use_key is not None else key()
+    text = r.text[:300].replace(k or "\0", "<key>")
     raise AIError(f"HTTP {r.status_code} {text}")
 
 
@@ -292,34 +441,47 @@ def _parse(text):
 
 
 # ---------------------------------------------------------------- one call
-def call(model: str, prompt: str, schema: dict, timeout: float | None = None):
+def call(model: str, prompt: str, schema: dict, timeout: float | None = None,
+         provider_id: str | None = None, key_val: str | None = None, base: str | None = None):
     """Ask one model. Returns (the parsed JSON answer, tokens sent, tokens written back).
 
     `timeout` is how long one answer may take. A live stream passes a short one, because a slow
     answer must not stop the recording."""
-    how = PROVIDERS[provider()][2]
-    return {"gemini": _gemini, "openai": _openai, "anthropic": _anthropic}[how](model, prompt, schema, timeout)
+    p = ALIASES.get(str(provider_id or provider()).lower(), str(provider_id or provider()).lower())
+    how = PROVIDERS[p][2]
+    k = key_val if key_val is not None else key()
+    b = base.rstrip("/") if base else (base_url() if not provider_id else PROVIDERS[p][1])
+    return {"gemini": _gemini, "openai": _openai, "anthropic": _anthropic}[how](model, prompt, schema, timeout, k, b)
 
 
-def see(prompt: str, image: bytes, timeout: float | None = None) -> tuple[str, int, int]:
+def see(prompt: str, image: bytes, timeout: float | None = None,
+        provider_id: str | None = None, key_val: str | None = None, base: str | None = None,
+        model_id: str | None = None) -> tuple[str, int, int]:
     """Ask one model about one picture: (the answer as text, tokens in, tokens out).
 
     Nothing is broken by a service that cannot look at pictures, or a model that is only text: the answer
     comes back empty, or says something the caller does not understand, and the caller carries on without
     it. The picture is a JPEG, passed as base64 inside the ordinary message."""
-    if not ready() or not image or not models():
+    p = ALIASES.get(str(provider_id or provider()).lower(), str(provider_id or provider()).lower())
+    k = key_val if key_val is not None else key()
+    b = base.rstrip("/") if base else (base_url() if not provider_id else PROVIDERS[p][1])
+    ms = [model_id] if model_id else (models() if not provider_id else DEFAULT_MODELS.get(p, [""]))
+    ms = [m for m in ms if m]
+    if not provider_id and not ready():
         return "", 0, 0
-    model = models()[0]
+    if not image or not ms:
+        return "", 0, 0
+    model = ms[0]
     b64 = base64.b64encode(image).decode()
-    how = PROVIDERS[provider()][2]
+    how = PROVIDERS[p][2]
     if how == "gemini":
         body = {"contents": [{"role": "user", "parts": [
             {"text": prompt},
             {"inline_data": {"mimeType": "image/jpeg", "data": b64}}]}]}
-        r = httpx.post(f"{base_url()}/{model}:generateContent", json=body,
-                       headers={"x-goog-api-key": key()}, timeout=timeout or 120)
+        r = httpx.post(f"{b}/{model}:generateContent", json=body,
+                       headers={"x-goog-api-key": k}, timeout=timeout or 120)
         if r.status_code != 200:
-            _fail(r, model)
+            _fail(r, model, k)
         data = r.json()
         text = "".join(p.get("text", "") for p in data["candidates"][0]["content"]["parts"])
         u = data.get("usageMetadata", {})
@@ -329,33 +491,35 @@ def see(prompt: str, image: bytes, timeout: float | None = None) -> tuple[str, i
         body = {"model": model, "max_tokens": 300, "messages": [{"role": "user", "content": [
             {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}},
             {"type": "text", "text": prompt}]}]}
-        r = httpx.post(f"{base_url()}/messages", json=body, timeout=timeout or 120,
-                       headers={"x-api-key": key(), "anthropic-version": "2023-06-01"})
+        r = httpx.post(f"{b}/messages", json=body, timeout=timeout or 120,
+                       headers={"x-api-key": k, "anthropic-version": "2023-06-01"})
         if r.status_code != 200:
-            _fail(r, model)
+            _fail(r, model, k)
         data = r.json()
         text = "".join(p.get("text", "") for p in data.get("content") or [] if p.get("type") == "text")
         u = data.get("usage") or {}
         return text, int(u.get("input_tokens") or 0), int(u.get("output_tokens") or 0)
-    headers = {"Authorization": f"Bearer {key()}"} if key() else {}
+    headers = {"Authorization": f"Bearer {k}"} if k else {}
     body = {"model": model, "stream": False, "messages": [{"role": "user", "content": [
         {"type": "text", "text": prompt},
         {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + b64}}]}]}
-    r = httpx.post(f"{base_url()}/chat/completions", json=body, headers=headers, timeout=timeout or 120)
+    r = httpx.post(f"{b}/chat/completions", json=body, headers=headers, timeout=timeout or 120)
     if r.status_code != 200:
-        _fail(r, model)
+        _fail(r, model, k)
     data = _openai_body(r)
     text = (data["choices"][0]["message"].get("content") or "")
     u = data.get("usage") or {}
     return text, int(u.get("prompt_tokens") or 0), int(u.get("completion_tokens") or 0)
 
 
-def _gemini(model, prompt, schema, timeout=None):
+def _gemini(model, prompt, schema, timeout=None, use_key=None, use_base=None):
+    k = use_key if use_key is not None else key()
+    b = use_base if use_base is not None else base_url()
     body = {"contents": [{"role": "user", "parts": [{"text": prompt}]}],
             "generationConfig": {"temperature": 0.4, "responseMimeType": "application/json", "responseSchema": schema}}
-    r = httpx.post(f"{base_url()}/{model}:generateContent", json=body, headers={"x-goog-api-key": key()}, timeout=timeout or 120)
+    r = httpx.post(f"{b}/{model}:generateContent", json=body, headers={"x-goog-api-key": k}, timeout=timeout or 120)
     if r.status_code != 200:
-        _fail(r, model)
+        _fail(r, model, k)
     data = r.json()
     text = "".join(p.get("text", "") for p in data["candidates"][0]["content"]["parts"])
     u = data.get("usageMetadata", {})
@@ -414,29 +578,33 @@ def _from_events(text: str) -> dict:
     return {"choices": [{"message": message}], "usage": usage}
 
 
-def _openai(model, prompt, schema, timeout=None):
-    headers = {"Authorization": f"Bearer {key()}"} if key() else {}
+def _openai(model, prompt, schema, timeout=None, use_key=None, use_base=None):
+    k = use_key if use_key is not None else key()
+    b = use_base if use_base is not None else base_url()
+    headers = {"Authorization": f"Bearer {k}"} if k else {}
     body = {"model": model, "messages": [{"role": "user", "content": _wrapped(prompt, schema)}], "stream": False}
     # Most services accept these two extras; a few models refuse one of them, so they are dropped on a refusal.
     extras = [{"temperature": 0.4, "response_format": {"type": "json_object"}}, {"response_format": {"type": "json_object"}}, {}]
     r = None
     for extra in extras:
-        r = httpx.post(f"{base_url()}/chat/completions", json={**body, **extra}, headers=headers, timeout=timeout or 180)
+        r = httpx.post(f"{b}/chat/completions", json={**body, **extra}, headers=headers, timeout=timeout or 180)
         if r.status_code not in (400, 422):
             break
     if r.status_code != 200:
-        _fail(r, model)
+        _fail(r, model, k)
     data = _openai_body(r)
     u = data.get("usage") or {}
     return _parse(data["choices"][0]["message"].get("content")), int(u.get("prompt_tokens") or 0), int(u.get("completion_tokens") or 0)
 
 
-def _anthropic(model, prompt, schema, timeout=None):
+def _anthropic(model, prompt, schema, timeout=None, use_key=None, use_base=None):
+    k = use_key if use_key is not None else key()
+    b = use_base if use_base is not None else base_url()
     body = {"model": model, "max_tokens": 8192, "messages": [{"role": "user", "content": _wrapped(prompt, schema)}]}
-    r = httpx.post(f"{base_url()}/messages", json=body, timeout=timeout or 180,
-                   headers={"x-api-key": key(), "anthropic-version": "2023-06-01"})
+    r = httpx.post(f"{b}/messages", json=body, timeout=timeout or 180,
+                   headers={"x-api-key": k, "anthropic-version": "2023-06-01"})
     if r.status_code != 200:
-        _fail(r, model)
+        _fail(r, model, k)
     data = r.json()
     text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
     u = data.get("usage") or {}
