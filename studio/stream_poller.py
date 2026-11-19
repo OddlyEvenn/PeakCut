@@ -66,6 +66,26 @@ def fetch_recent_channel_videos(channel_url: str, limit: int = 2) -> list:
         return []
 
 
+def matches_game_filter(title: str, focus: str | None = None) -> bool:
+    """Check if a video title matches the targeted game filter (e.g. GTA 6)."""
+    from . import games
+    focus_game = (focus or config.env("PEAKCUT_FOCUS_GAME", "Grand Theft Auto VI")).strip()
+    if not focus_game or focus_game.lower() in ("all", "any", "none", "*"):
+        return True
+
+    detected_game, _ = games.detect(title)
+    if detected_game and (focus_game.lower() in detected_game.lower() or detected_game.lower() in focus_game.lower()):
+        return True
+
+    # High-recall keyword matching for GTA 6
+    gta_keywords = ["gta 6", "gta vi", "gta6", "grand theft auto 6", "grand theft auto vi", "vice city", "lucia", "jason"]
+    title_lower = title.lower()
+    if any(k in focus_game.lower() for k in ("gta", "grand theft auto")):
+        return any(kw in title_lower for kw in gta_keywords)
+
+    return focus_game.lower() in title_lower
+
+
 def check_creator_streams(cid: str, max_check: int = 2) -> list:
     """Check a single creator's channel for new stream VODs and enqueue jobs."""
     from . import circuit_breaker
@@ -86,20 +106,29 @@ def check_creator_streams(cid: str, max_check: int = 2) -> list:
     existing_job_urls = {j.get("source", {}).get("url") for j in jobs.list_jobs()}
     new_jobs = []
 
+    focus = c.get("game") or config.env("PEAKCUT_FOCUS_GAME", "Grand Theft Auto VI")
+
     for channel_url in urls:
         videos = fetch_recent_channel_videos(channel_url, limit=max_check)
         for v in videos:
             vid = v["id"]
             v_url = v["url"]
+            title = v["title"]
+
+            # Filter for GTA 6 if game focus is enabled
+            if focus and not matches_game_filter(title, focus):
+                print(f"[PeakCut] [POLLER] Skipping non-GTA stream: '{title}'", flush=True)
+                continue
+
             if is_seen(vid) or v_url in existing_job_urls:
                 continue
 
             # Mark seen immediately so concurrent pollers won't duplicate
             mark_seen(vid)
             try:
-                print(f"[PeakCut] [POLLER] Found new stream for {c['name']}: '{v['title']}' ({v_url})", flush=True)
-                job = jobs.create({"type": "url", "url": v_url, "name": v["title"]}, {}, creator=cid)
-                creators.log(cid, f"Auto-detected stream: {v['title']}")
+                print(f"[PeakCut] [POLLER] Found new GTA stream for {c['name']}: '{title}' ({v_url})", flush=True)
+                job = jobs.create({"type": "url", "url": v_url, "name": title}, {}, creator=cid)
+                creators.log(cid, f"Auto-detected GTA stream: {title}")
                 new_jobs.append(job)
                 circuit_breaker.creator.record_success(cid)
             except Exception as e:

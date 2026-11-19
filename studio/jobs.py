@@ -180,7 +180,15 @@ def save(job):
             return
         tmp = d / "job.json.tmp"
         tmp.write_text(text, encoding="utf-8")
-        tmp.replace(d / "job.json")
+        for attempt in range(8):
+            try:
+                tmp.replace(d / "job.json")
+                break
+            except (PermissionError, OSError):
+                if attempt == 7:
+                    pass
+                else:
+                    time.sleep(0.05 * (attempt + 1))
 
 
 def _set(job, **kw):
