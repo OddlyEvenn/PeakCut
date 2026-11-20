@@ -2,7 +2,7 @@ module.exports = {
   apps: [
     {
       name: "peakcut",
-      script: "python",
+      script: "pythonw",
       args: "-m studio.server",
       cwd: "C:/Users/EVEN/Desktop/Even/PeakCut",
       interpreter: "none",
