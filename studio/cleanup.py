@@ -221,6 +221,7 @@ def emergency_disk_cleanup():
 def run_cycle():
     """Run one complete cleanup and storage reclamation cycle."""
     from . import circuit_breaker
+    free_gb = circuit_breaker.disk.free_gb()
     if not circuit_breaker.disk.is_disk_safe():
         emergency_disk_cleanup()
     else:
@@ -231,6 +232,7 @@ def run_cycle():
                 prune_source_video(j["id"])
                 prune_clip_source_pieces(j["id"])
         prune_finished_session_buffers()
+        print(f"[PeakCut] [CLEANUP] Storage maintenance cycle completed cleanly (free space: {free_gb} GB)", flush=True)
 
 
 def _cleanup_loop():
